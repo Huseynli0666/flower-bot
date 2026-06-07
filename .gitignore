@@ -1,0 +1,8 @@
+venv/
+.env
+__pycache__/
+*.pyc
+*.log
+subscribers.json
+history.json
+pending_post.txt
