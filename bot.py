@@ -790,7 +790,7 @@ async def cmd_test(message: Message):
     text = build_notification(event["name"], event["date"], days)
     chart = make_event_growth_chart(event["name"], days)
     await post_to_channel(message.bot, text, photo=chart)
-    await message.answer(f"✅ Тест опубликован: «{event['name']}»")
+    await message.answer(f"📋 Пост отправлен на согласование: «{event['name']}»")
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
