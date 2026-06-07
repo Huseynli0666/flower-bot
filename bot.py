@@ -30,8 +30,9 @@ ADMIN_IDS     = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.str
 CHANNEL_ID    = int(os.getenv("CHANNEL_ID", "-1003755821511"))
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
-SUBSCRIBERS_FILE = Path("subscribers.json")
-HISTORY_FILE     = Path("history.json")
+SUBSCRIBERS_FILE  = Path("subscribers.json")
+HISTORY_FILE      = Path("history.json")
+PENDING_FILE      = Path("pending_approvals.json")  # очередь на согласование
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -307,11 +308,12 @@ MORNING_TIPS = [
 EVENING_TIPS = [
     {
         "text": "🌹 *Как правильно хранить розы*\n\n"
-                "✂️ Срез под углом 45° в воде — каждые 2 дня\n"
-                "💧 Меняйте воду ежедневно, температура комнатная\n"
-                "🍃 Удаляйте листья ниже уровня воды\n"
-                "🌡 Оптимально +15–18°C, без сквозняка\n"
-                "⏰ При правильном уходе — 7–14 дней\n\n"
+                "❄️ Холодильник: +2–5°C — оптимальная температура хранения\n"
+                "✂️ Срез под углом 45° острым ножом, обновлять каждые 2 дня\n"
+                "💧 Вода комнатной температуры, менять ежедневно\n"
+                "🍃 Убирайте все листья ниже уровня воды\n"
+                "🚫 Не ставьте рядом с фруктами — этилен ускоряет увядание\n"
+                "⏰ При правильном хранении — 7–14 дней\n\n"
                 "─────────────────\n🌷 Календарь цветочного бизнеса"
     },
     {
@@ -576,9 +578,40 @@ async def generate_post_with_ai(idea: str) -> str:
         log.error(f"Claude API error: {ex}")
         return f"💡 *Совет для флористов*\n\n{idea}\n\n─────────────────\n🌷 Календарь цветочного бизнеса"
 
+# ─── Очередь согласования ────────────────────────────────────────────────────
+
+def load_pending() -> dict:
+    return load_json(PENDING_FILE, {})
+
+def save_pending(data: dict):
+    save_json(PENDING_FILE, data)
+
+def add_pending(post_id: str, text: str, photo: bytes = None):
+    p = load_pending()
+    p[post_id] = {"text": text, "has_photo": photo is not None}
+    save_pending(p)
+    if photo:
+        Path(f"pending_{post_id}.png").write_bytes(photo)
+
+def get_pending(post_id: str) -> dict | None:
+    return load_pending().get(post_id)
+
+def remove_pending(post_id: str):
+    p = load_pending()
+    p.pop(post_id, None)
+    save_pending(p)
+    Path(f"pending_{post_id}.png").unlink(missing_ok=True)
+
+def approval_keyboard(post_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"approve:{post_id}"),
+        InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit:{post_id}"),
+        InlineKeyboardButton(text="❌ Отменить",     callback_data=f"reject:{post_id}"),
+    ]])
+
 # ─── Публикация ───────────────────────────────────────────────────────────────
 
-async def post_to_channel(bot: Bot, text: str, photo: bytes = None):
+async def publish_to_channel(bot: Bot, text: str, photo: bytes = None):
     try:
         if photo:
             await bot.send_photo(
@@ -588,8 +621,37 @@ async def post_to_channel(bot: Bot, text: str, photo: bytes = None):
             )
         else:
             await bot.send_message(CHANNEL_ID, text, parse_mode="Markdown")
+        log.info("Published to channel")
     except Exception as ex:
         log.error(f"Channel post error: {ex}")
+
+async def post_to_channel(bot: Bot, text: str, photo: bytes = None):
+    """Отправляет пост на согласование админу."""
+    import uuid
+    post_id = uuid.uuid4().hex[:8]
+    add_pending(post_id, text, photo)
+
+    preview = text[:800] + ("..." if len(text) > 800 else "")
+
+    for admin_id in ADMIN_IDS:
+        try:
+            if photo:
+                await bot.send_photo(
+                    admin_id,
+                    photo=BufferedInputFile(photo, filename="img.png"),
+                    caption=f"📋 *Новый пост на согласование:*\n\n{preview}",
+                    parse_mode="Markdown",
+                    reply_markup=approval_keyboard(post_id),
+                )
+            else:
+                await bot.send_message(
+                    admin_id,
+                    f"📋 *Новый пост на согласование:*\n\n{preview}",
+                    parse_mode="Markdown",
+                    reply_markup=approval_keyboard(post_id),
+                )
+        except Exception as ex:
+            log.error(f"Approval send error: {ex}")
 
 # ─── Расписание ───────────────────────────────────────────────────────────────
 
@@ -754,6 +816,31 @@ async def handle_plain_text(message: Message):
     raw = (message.text or "").strip()
     if not raw or raw.startswith("/"): return
 
+    # Режим редактирования scheduled поста
+    edit_id_file = Path("editing_post_id.txt")
+    if edit_id_file.exists():
+        post_id = edit_id_file.read_text(encoding="utf-8").strip()
+        edit_id_file.unlink(missing_ok=True)
+        pending = get_pending(post_id)
+        if pending:
+            p = load_pending()
+            p[post_id]["text"] = raw
+            save_pending(p)
+            photo = Path(f"pending_{post_id}.png").read_bytes() if pending["has_photo"] else None
+            if photo:
+                await message.answer_photo(
+                    BufferedInputFile(photo, filename="img.png"),
+                    caption=f"*Обновлённый пост:*\n\n{raw}\n\nОпубликовать?",
+                    parse_mode="Markdown", reply_markup=approval_keyboard(post_id),
+                )
+            else:
+                await message.answer(
+                    f"*Обновлённый пост:*\n\n{raw}\n\nОпубликовать?",
+                    parse_mode="Markdown", reply_markup=approval_keyboard(post_id),
+                )
+        return
+
+    # Новая идея для поста
     wait = await message.answer("✍️ Claude пишет пост...")
     post = await generate_post_with_ai(raw)
     Path("pending_post.txt").write_text(post, encoding="utf-8")
@@ -768,12 +855,11 @@ async def cb_yes(call: CallbackQuery):
     p = Path("pending_post.txt")
     if not p.exists(): await call.answer("Пост не найден.", show_alert=True); return
     post = p.read_text(encoding="utf-8"); p.unlink()
-    # Генерируем карточку
     lines_raw = post.split("\n")
     title = lines_raw[0].replace("*", "").strip()
     body_lines = [l for l in lines_raw[2:] if l and not l.startswith("─") and "Календарь" not in l]
     img = make_tip_card(title, body_lines)
-    await post_to_channel(call.bot, post, photo=img)
+    await publish_to_channel(call.bot, post, photo=img)
     await call.message.edit_text("✅ Опубликовано в канале!")
     await call.answer()
 
@@ -782,6 +868,48 @@ async def cb_no(call: CallbackQuery):
     Path("pending_post.txt").unlink(missing_ok=True)
     await call.message.edit_text("🗑 Пост отменён.")
     await call.answer()
+
+# ─── Обработчики согласования scheduled постов ───────────────────────────────
+
+@router.callback_query(F.data.startswith("approve:"))
+async def cb_approve(call: CallbackQuery):
+    post_id = call.data.split(":", 1)[1]
+    pending = get_pending(post_id)
+    if not pending:
+        await call.answer("Пост не найден.", show_alert=True); return
+    text = pending["text"]
+    photo = Path(f"pending_{post_id}.png").read_bytes() if pending["has_photo"] else None
+    remove_pending(post_id)
+    await publish_to_channel(call.bot, text, photo=photo)
+    await call.message.edit_caption("✅ Опубликовано в канале!") if pending["has_photo"] else await call.message.edit_text("✅ Опубликовано в канале!")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("reject:"))
+async def cb_reject(call: CallbackQuery):
+    post_id = call.data.split(":", 1)[1]
+    remove_pending(post_id)
+    await call.message.edit_caption("❌ Пост отменён.") if call.message.photo else await call.message.edit_text("❌ Пост отменён.")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("edit:"))
+async def cb_edit(call: CallbackQuery):
+    post_id = call.data.split(":", 1)[1]
+    pending = get_pending(post_id)
+    if not pending:
+        await call.answer("Пост не найден.", show_alert=True); return
+    # Сохраняем ID для редактирования
+    Path("editing_post_id.txt").write_text(post_id, encoding="utf-8")
+    await call.message.reply(
+        "✏️ Отправь новый текст поста — я заменю им текущий и опубликую в канал.\n\n"
+        "Или напиши /cancel чтобы оставить как есть."
+    )
+    await call.answer()
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    Path("editing_post_id.txt").unlink(missing_ok=True)
+    await message.answer("↩️ Редактирование отменено.")
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
